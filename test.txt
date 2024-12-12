@@ -1,43 +1,242 @@
-import socket
-import json
+#include <iostream>
+#include <vector>
+#include <string>
+#include <thread>
+#include <mutex>
+#include <chrono>
+#include <fstream>
+#include <sstream>
+#include <cstring>
+#include <atomic>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
-def distribute_work(machines, shadow_file):
-    for machine in machines:
-        host, port = machine['ip'], machine['port']
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                # Enable address reuse
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.connect((host, port))
-                
-                # Prepare and send task payload
-                task = {"shadow_file": shadow_file}
-                s.sendall(json.dumps(task).encode('utf-8'))
-                print(f"Task sent to {host}:{port}")
-        except socket.error as e:
-            print(f"Socket error connecting to {host}:{port} - {e}")
-        except Exception as e:
-            print(f"Unexpected error connecting to {host}:{port} - {e}")
+#define DISCOVERY_PORT 3455
+#define WORKER_PORT 7878
+#define RESULT_PORT 7879
+#define BUFFER_SIZE 1024
 
-def collect_results(machines):
-    results = []
-    for machine in machines:
-        host, port = machine['ip'], machine['port']
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                # Enable address reuse
-                s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-                s.connect((host, port))
+std::vector<std::string> discover_workers() {
+    int sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (sock < 0) {
+        perror("Failed to create socket");
+        exit(EXIT_FAILURE);
+    }
 
-                # Send request for results
-                s.sendall(b"RESULT")
-                data = s.recv(4096).decode('utf-8')  # Increased buffer size for larger responses
-                if data:
-                    results.append(data)
-                    print(f"Received data from {host}:{port}")
-        except socket.error as e:
-            print(f"Socket error connecting to {host}:{port} - {e}")
-        except Exception as e:
-            print(f"Unexpected error connecting to {host}:{port} - {e}")
+    sockaddr_in broadcast_addr = {};
+    broadcast_addr.sin_family = AF_INET;
+    broadcast_addr.sin_port = htons(DISCOVERY_PORT);
+    broadcast_addr.sin_addr.s_addr = INADDR_BROADCAST;
 
-    return results if results else None
+    int broadcast_enable = 1;
+    if (setsockopt(sock, SOL_SOCKET, SO_BROADCAST, &broadcast_enable, sizeof(broadcast_enable)) < 0) {
+        perror("Failed to enable broadcast");
+        exit(EXIT_FAILURE);
+    }
+
+    std::string discover_msg = "DISCOVER";
+    if (sendto(sock, discover_msg.c_str(), discover_msg.size(), 0, (sockaddr*)&broadcast_addr, sizeof(broadcast_addr)) < 0) {
+        perror("Failed to send discovery message");
+        exit(EXIT_FAILURE);
+    }
+
+    std::vector<std::string> workers;
+    char buffer[BUFFER_SIZE];
+    sockaddr_in sender_addr;
+    socklen_t sender_addr_len = sizeof(sender_addr);
+
+    auto start_time = std::chrono::steady_clock::now();
+    while (std::chrono::steady_clock::now() - start_time < std::chrono::seconds(5)) {
+        int recv_len = recvfrom(sock, buffer, BUFFER_SIZE - 1, MSG_DONTWAIT, (sockaddr*)&sender_addr, &sender_addr_len);
+        if (recv_len > 0) {
+            buffer[recv_len] = '\0';
+            std::string response(buffer);
+            if (response == "WORKER") {
+                char worker_ip[INET_ADDRSTRLEN];
+                inet_ntop(AF_INET, &sender_addr.sin_addr, worker_ip, INET_ADDRSTRLEN);
+                workers.push_back(std::string(worker_ip) + ":" + std::to_string(WORKER_PORT));
+            }
+        }
+    }
+
+    if (workers.empty()) {
+        std::cout << "No remote workers found within timeout.\n";
+    }
+
+    close(sock);
+    return workers;
+}
+
+void send_task(const std::string& worker_addr, int chunk_start, int chunk_end, const std::string& hash, int thread_count, int password_length) {
+    size_t colon_pos = worker_addr.find(":");
+    std::string ip = worker_addr.substr(0, colon_pos);
+    int port = std::stoi(worker_addr.substr(colon_pos + 1));
+
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) {
+        perror("Failed to create socket");
+        return;
+    }
+
+    sockaddr_in worker_addr_in = {};
+    worker_addr_in.sin_family = AF_INET;
+    worker_addr_in.sin_port = htons(port);
+    if (inet_pton(AF_INET, ip.c_str(), &worker_addr_in.sin_addr) <= 0) {
+        perror("Invalid address");
+        close(sock);
+        return;
+    }
+
+    if (connect(sock, (sockaddr*)&worker_addr_in, sizeof(worker_addr_in)) < 0) {
+        perror("Failed to connect to worker");
+        close(sock);
+        return;
+    }
+
+    std::ostringstream task_stream;
+    task_stream << chunk_start << "," << chunk_end << "," << hash << "," << thread_count << "," << password_length;
+    std::string task = task_stream.str();
+
+    if (send(sock, task.c_str(), task.size(), 0) < 0) {
+        perror("Failed to send task to worker");
+    }
+
+    close(sock);
+}
+
+void collect_results(std::vector<std::string>& results, std::mutex& results_mutex, std::atomic<bool>& done) {
+    int listener = socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) {
+        perror("Failed to create listener socket");
+        return;
+    }
+
+    sockaddr_in listener_addr = {};
+    listener_addr.sin_family = AF_INET;
+    listener_addr.sin_port = htons(RESULT_PORT);
+    listener_addr.sin_addr.s_addr = INADDR_ANY;
+
+    if (bind(listener, (sockaddr*)&listener_addr, sizeof(listener_addr)) < 0) {
+        perror("Failed to bind listener socket");
+        close(listener);
+        return;
+    }
+
+    if (listen(listener, 5) < 0) {
+        perror("Failed to listen on socket");
+        close(listener);
+        return;
+    }
+
+    while (!done) {
+        int client_sock = accept(listener, nullptr, nullptr);
+        if (client_sock < 0) {
+            continue;
+        }
+
+        char buffer[BUFFER_SIZE];
+        int bytes_read = read(client_sock, buffer, BUFFER_SIZE - 1);
+        if (bytes_read > 0) {
+            buffer[bytes_read] = '\0';
+            std::lock_guard<std::mutex> lock(results_mutex);
+            results.push_back(std::string(buffer));
+        }
+
+        close(client_sock);
+    }
+
+    close(listener);
+}
+
+int main() {
+    std::vector<std::string> workers = discover_workers();
+    workers.push_back("127.0.0.1:" + std::to_string(WORKER_PORT));
+
+    for (const auto& worker : workers) {
+        std::cout << "Worker found: " << worker << "\n";
+    }
+
+    std::cout << "Enter username: ";
+    std::string username;
+    std::getline(std::cin, username);
+
+    std::ifstream shadow_file("shadow_file.txt");
+    if (!shadow_file.is_open()) {
+        std::cerr << "Shadow file not found.\n";
+        return 1;
+    }
+
+    std::string line, target_hash;
+    while (std::getline(shadow_file, line)) {
+        std::istringstream line_stream(line);
+        std::string user, hash;
+        if (std::getline(line_stream, user, ':') && std::getline(line_stream, hash, ':')) {
+            if (user == username) {
+                target_hash = hash;
+                break;
+            }
+        }
+    }
+
+    if (target_hash.empty()) {
+        std::cerr << "User not found in shadow file.\n";
+        return 1;
+    }
+
+    std::cout << "Enter maximum password length: ";
+    int password_length;
+    std::cin >> password_length;
+    if (password_length <= 0) {
+        std::cerr << "Invalid password length.\n";
+        return 1;
+    }
+
+    std::cout << "Enter number of threads: ";
+    int thread_count;
+    std::cin >> thread_count;
+    if (thread_count <= 0) {
+        std::cerr << "Invalid thread count.\n";
+        return 1;
+    }
+
+    const int charset_size = 62;
+    int total_combinations = 0;
+    for (int len = 1; len <= password_length; ++len) {
+        total_combinations += static_cast<int>(std::pow(charset_size, len));
+    }
+
+    int chunk_size = total_combinations / workers.size();
+
+    std::vector<std::string> results;
+    std::mutex results_mutex;
+    std::atomic<bool> done(false);
+
+    std::thread result_collector(collect_results, std::ref(results), std::ref(results_mutex), std::ref(done));
+
+    for (size_t i = 0; i < workers.size(); ++i) {
+        int chunk_start = i * chunk_size;
+        int chunk_end = (i == workers.size() - 1) ? total_combinations - 1 : (i + 1) * chunk_size - 1;
+        send_task(workers[i], chunk_start, chunk_end, target_hash, thread_count, password_length);
+    }
+
+    while (true) {
+        std::lock_guard<std::mutex> lock(results_mutex);
+        for (const auto& result : results) {
+            if (result != "not found") {
+                std::cout << "Password found: " << result << "\n";
+                done = true;
+                result_collector.join();
+                return 0;
+            }
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    }
+
+    done = true;
+    result_collector.join();
+    std::cout << "Password not found.\n";
+    return 0;
+}
+
